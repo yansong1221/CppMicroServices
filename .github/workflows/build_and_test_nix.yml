@@ -24,7 +24,7 @@ jobs:
       WITH_COVERAGE: 0
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v5
       with:
         submodules: true
     
@@ -48,7 +48,7 @@ jobs:
       WITH_COVERAGE: 0
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v5
       with:
         submodules: true
     
@@ -78,7 +78,7 @@ jobs:
         buildconfiguration: [0,1,2,3]
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v5
       with:
          submodules: true
 
@@ -86,11 +86,11 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y valgrind
-      if: ${{matrix.os == 'ubuntu-22.04'}}
+      if: ${{startsWith(matrix.os, 'ubuntu')}}
 
     - name: Build And Test
       run: ctest -VV -S ${{github.workspace}}/cmake/usCTestScript_github.cmake
-      env: 
+      env:
          BUILD_CONFIGURATION: ${{matrix.buildconfiguration}}
          BUILD_DIR: ${{github.workspace}}/build_${{matrix.buildconfiguration}}
       
@@ -110,7 +110,7 @@ jobs:
         os: [ubuntu-22.04, macos-latest]
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v5
       with:
         submodules: true
 
@@ -118,10 +118,10 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y valgrind
-      if: ${{matrix.os == 'ubuntu-22.04'}}
+      if: ${{startsWith(matrix.os, 'ubuntu')}}
 
     - name: Build And Test
       run: ctest -VV -S ${{github.workspace}}/cmake/usCTestScript_github.cmake
-      env: 
+      env:
          BUILD_DIR: ${{github.workspace}}/build_0
          
