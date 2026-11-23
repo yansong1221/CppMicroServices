@@ -122,6 +122,8 @@ namespace cppmicroservices
             FRIEND_TEST(SingletonComponentConfigurationTest, TestModifiedMethodExceptionLogging);
             FRIEND_TEST(SingletonComponentConfigurationTest, TestGetService);
             FRIEND_TEST(SingletonComponentConfigurationTest, TestDestroyComponentInstances_DeactivateFailure);
+            FRIEND_TEST(SingletonComponentConfigurationTest, VerifyBindReferenceDoesNotDoubleBind);
+            FRIEND_TEST(SingletonComponentConfigurationTest, VerifyBindReferenceNoBinderDoesNotLogError);
             FRIEND_TEST(ConfigAdminComponentCreationRace, TestModifiedIsNeverCalled);
             FRIEND_TEST(ConfigAdminComponentCreationRace, TestMultipleConfigsNoModifiedCall);
             FRIEND_TEST(ConfigAdminComponentCreationRace, TestMultipleConfigsModifiedCalled);

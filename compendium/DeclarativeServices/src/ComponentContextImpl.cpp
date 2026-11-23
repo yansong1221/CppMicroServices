@@ -248,6 +248,34 @@ namespace cppmicroservices::scrimpl
         return nullptr;
     }
 
+    /**
+     * Returns the interface id declared for the reference named refName in the
+     * component's metadata, or an empty string if no such reference is found (or
+     * the metadata is unavailable).
+     *
+     * A service may be registered under several interfaces, each stored in the
+     * InterfaceMap under its own id. A reference binds a specific declared
+     * interface, so lookups must key on that id rather than falling back to an
+     * arbitrary (begin()) entry, which for a multi-interface service would return
+     * a sub-object of the wrong, mis-adjusted type.
+     */
+    std::string
+    GetDeclaredInterfaceId(std::shared_ptr<ComponentConfiguration> const& configManagerPtr,
+                           std::string const& refName)
+    {
+        if (auto const metadata = configManagerPtr->GetMetadata(); metadata)
+        {
+            for (auto const& refMeta : metadata->refsMetadata)
+            {
+                if (refMeta.name == refName)
+                {
+                    return refMeta.interfaceName;
+                }
+            }
+        }
+        return {};
+    }
+
     std::shared_ptr<void>
     ComponentContextImpl::LocateService(std::string const& refName, std::string const& type) const
     {
@@ -295,8 +323,12 @@ namespace cppmicroservices::scrimpl
 
             if (matchingServiceInterfaceMapPtr != services.end())
             {
-                // returns the service at the interfacemap::begin() position
-                return GetServicePointer(configManagerPtr, matchingServiceInterfaceMapPtr->second, refName, "");
+                // Resolve the pointer by the interface the reference declared. A
+                // service bound to this reference may implement several interfaces;
+                // passing an empty type would fall back to the first map entry and
+                // return a mis-adjusted sub-object of the wrong type.
+                auto const interfaceId = GetDeclaredInterfaceId(configManagerPtr, refName);
+                return GetServicePointer(configManagerPtr, matchingServiceInterfaceMapPtr->second, refName, interfaceId);
             }
         }
 
@@ -414,21 +446,63 @@ namespace cppmicroservices::scrimpl
         boundServicesCacheHandle->clear();
     }
 
-    std::shared_ptr<void>
+    std::pair<std::shared_ptr<void>, bool>
     ComponentContextImpl::AddToBoundServicesCache(std::string const& refName,
                                                   cppmicroservices::ServiceReferenceBase const& sRef)
     {
+        auto const configManagerPtr = configManager.lock();
+        if (!configManagerPtr)
+        {
+            throw ComponentException("Context is invalid");
+        }
+
         auto bc = GetBundleContext();
         cppmicroservices::ServiceObjects<void> sObjs = bc.GetServiceObjects(ServiceReferenceU(sRef));
         auto interfaceMap = sObjs.GetService();
         if (!interfaceMap || interfaceMap->empty())
         {
-            return nullptr;
+            return { nullptr, false };
         }
-        std::shared_ptr<void> svcToBind = interfaceMap->begin()->second;
+        // Bind the interface that this reference actually declared. The bound
+        // service may implement several interfaces, select the right one using the config's metadata
+        std::string const interfaceId = GetDeclaredInterfaceId(configManagerPtr, refName);
+
+        // GetInterfacePointer handles the degenerate case (empty interfaceId
+        // falls back to the first entry) and distinguishes "not present" from
+        // "present but null". The returned pointer may be null when the service
+        // failed to construct/activate; the service is still added to the cache
+        // so a subsequent LocateService can surface the error for a mandatory
+        // dependency.
+        std::shared_ptr<void> svcToBind = GetInterfacePointer(interfaceMap, interfaceId).service;
+
+        // Binding is idempotent: don't bind the same service reference to the same
+        // reference more than once. This can happen when a service is captured by
+        // the activation path's bound-services snapshot while a rebind for that
+        // same service is concurrently queued
+        if (IsBound(refName, sRef))
+        {
+            return { svcToBind, false };
+        }
         auto boundServicesCacheHandle = boundServicesCache.lock();
         (*boundServicesCacheHandle)[refName].emplace_back(std::make_pair(sRef, interfaceMap));
-        return svcToBind;
+        return { svcToBind, true };
+    }
+
+    bool
+    ComponentContextImpl::IsBound(std::string const& refName,
+                                  cppmicroservices::ServiceReferenceBase const& sRef) const
+    {
+        auto boundServicesCacheHandle = boundServicesCache.lock();
+        auto refIt = boundServicesCacheHandle->find(refName);
+        if (refIt == boundServicesCacheHandle->end())
+        {
+            return false;
+        }
+        auto const& services = refIt->second;
+        return std::any_of(services.begin(),
+                           services.end(),
+                           [&sRef](std::pair<ServiceReferenceBase, InterfaceMapConstPtr> const& service)
+                           { return (std::get<0>(service) == sRef); });
     }
 
     void

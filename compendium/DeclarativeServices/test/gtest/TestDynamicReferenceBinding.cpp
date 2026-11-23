@@ -22,10 +22,12 @@
 
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../../src/manager/ReferenceManagerImpl.hpp"
 #include "../TestUtils.hpp"
+#include "ConcurrencyTestUtil.hpp"
 #include "TestInterfaces/Interfaces.hpp"
 #include "cppmicroservices/BundleContext.h"
 #include "cppmicroservices/Framework.h"
@@ -355,6 +357,95 @@ TEST(DynamicReferenceBinding, OneBindPerServiceForDynamicReluctantMultiple)
     framework.WaitForStop(std::chrono::milliseconds::zero());
 }
 
+namespace
+{
+    // Extract the integer value following "key=" in a component ExtendedDescription
+    // string such as "bindCount=1 nullBindCount=0 ... optionalDeps=1".
+    int
+    ExtractCount(std::string const& desc, std::string const& key)
+    {
+        auto pos = desc.find(key + "=");
+        if (pos == std::string::npos)
+        {
+            return -1;
+        }
+        return std::stoi(desc.substr(pos + key.size() + 1));
+    }
+} // namespace
+
+// The TestBundleDSDROM component has a static required reference (test::Interface1)
+// and a dynamic reluctant 0..n reference (test::Interface3). Registering Interface1
+// activates the (immediate) component; if a single Interface3 service is registered
+// concurrently, there is a window in which that service is both (a) captured by the
+// activation path's bound-services snapshot and bound during BindReferences, and
+// (b) delivered again by the queued Rebind -- ensure we don't double bind the same svc
+TEST(DynamicReferenceBinding, ConcurrentActivationAndDependencyChangeDoesNotDoubleBind)
+{
+    auto framework = cppmicroservices::FrameworkFactory().NewFramework();
+    framework.Start();
+    auto bc = framework.GetBundleContext();
+
+    test::InstallAndStartDS(bc);
+    auto testBundle = test::InstallAndStartBundle(bc, "TestBundleDSDROM");
+    ASSERT_TRUE(testBundle);
+
+    constexpr int kIterations = 500;
+    for (int i = 0; i < kIterations; ++i)
+    {
+        Barrier startLine(2);
+
+        // Thread A: trigger activation by registering the static required dependency.
+        // Thread B: register the single dynamic (Interface3) dependency.
+        // Both are released simultaneously so activation and the dependency change
+        // race, exactly as they would for a client whose provider bundles load
+        // concurrently.
+        cppmicroservices::ServiceRegistration<test::Interface1> staticDepReg;
+        cppmicroservices::ServiceRegistration<test::Interface3> optionalDepReg;
+
+        std::thread activator(
+            [&]
+            {
+                startLine.Wait();
+                staticDepReg = bc.RegisterService<test::Interface1>(std::make_shared<Interface1Impl>());
+            });
+        std::thread depChanger(
+            [&]
+            {
+                startLine.Wait();
+                optionalDepReg = bc.RegisterService<test::Interface3>(std::make_shared<Interface3Impl>());
+            });
+        activator.join();
+        depChanger.join();
+
+        auto svcRef = bc.GetServiceReference<test::Interface2>();
+        ASSERT_TRUE(svcRef);
+        auto svc = bc.GetService<test::Interface2>(svcRef);
+        ASSERT_TRUE(svc);
+
+        auto desc = svc->ExtendedDescription();
+        svc.reset();
+
+        int duplicateBinds = ExtractCount(desc, "duplicateBindCount");
+
+        ASSERT_EQ(duplicateBinds, 0)
+            << "iteration " << i
+            << ": the component's bind method was invoked twice for the SAME service on the SAME "
+               "'optionalDeps' reference (bind called twice for the same reference). Got: "
+            << desc;
+
+        // Reset for the next iteration: removing the static required dependency
+        // deactivates the component and destroys the instance, so bind counts start
+        // fresh on the next activation.
+        optionalDepReg.Unregister();
+        staticDepReg.Unregister();
+        ASSERT_FALSE(bc.GetServiceReference<test::Interface2>())
+            << "iteration " << i << ": component did not deactivate after removing its required dependency.";
+    }
+
+    framework.Stop();
+    framework.WaitForStop(std::chrono::milliseconds::zero());
+}
+
 // Verify that unbind is not called with nullptr during component deactivation
 // when the dynamic service was already removed at runtime.
 TEST(DynamicReferenceBinding, UnbindNotCalledWithNullptrDuringDeactivation)
@@ -413,6 +504,110 @@ TEST(DynamicReferenceBinding, UnbindNotCalledWithNullptrDuringDeactivation)
         << "Unbind must not be called with nullptr during deactivation. Got: " << desc;
 
     staticDepReg2.Unregister();
+    framework.Stop();
+    framework.WaitForStop(std::chrono::milliseconds::zero());
+}
+
+// ============================================================
+// Regression test for the "wrong dynamic bind" defect.
+//
+// TestBundleDSMIProvider provides a single component that implements two
+// independent interfaces, test::MultiInterfaceA and test::MultiInterfaceB, both
+// declared (in that order) under service.interfaces. Because the interfaces are
+// unrelated bases, static_cast<MultiInterfaceB*>(c) != static_cast<MultiInterfaceA*>(c).
+//
+// TestBundleDSMIConsumer is an immediate component with a dynamic reluctant
+// 0..n reference to test::MultiInterfaceA. When the dependING services asks
+// whoA(), a method implemented by A, it should get A not get dispatched to whoB().
+// ============================================================
+TEST(DynamicReferenceBinding, DynamicRefBindsDeclaredInterfaceOfMultiInterfaceService)
+{
+    auto framework = cppmicroservices::FrameworkFactory().NewFramework();
+    framework.Start();
+    auto bc = framework.GetBundleContext();
+
+    test::InstallAndStartDS(bc);
+
+    // Consumer becomes active immediately -- its only reference is optional 0..n.
+    auto consumerBundle = test::InstallAndStartBundle(bc, "TestBundleDSMIConsumer");
+    ASSERT_TRUE(consumerBundle);
+
+    auto probeRef = bc.GetServiceReference<test::MultiInterfaceProbe>();
+    ASSERT_TRUE(probeRef);
+    auto probe = bc.GetService<test::MultiInterfaceProbe>(probeRef);
+    ASSERT_TRUE(probe);
+    ASSERT_EQ(probe->BoundCount(), 0u) << "No provider yet -- nothing should be bound.";
+
+    // Start the provider bundle. Its component provides both MultiInterfaceA and
+    // MultiInterfaceB; DS registers it and the consumer's dynamic reference is
+    // satisfied through the runtime bind path.
+    auto providerBundle = test::InstallAndStartBundle(bc, "TestBundleDSMIProvider");
+    ASSERT_TRUE(providerBundle);
+
+    ASSERT_EQ(probe->BoundCount(), 1u)
+        << "Provider registered one MultiInterfaceA service; expected exactly one bind.";
+
+    // Sanity check: fetching MultiInterfaceA directly returns the correct
+    // sub-object, proving the provider is well-formed and the expected value is "A".
+    auto directRef = bc.GetServiceReference<test::MultiInterfaceA>();
+    ASSERT_TRUE(directRef);
+    auto directA = bc.GetService<test::MultiInterfaceA>(directRef);
+    ASSERT_TRUE(directA);
+    EXPECT_EQ(directA->WhoA(), "A");
+
+    // The bound reference must dispatch as MultiInterfaceA. On the buggy runtime
+    // bind path it instead holds the MultiInterfaceB sub-object and returns "B".
+    EXPECT_EQ(probe->BoundIdentity(), "A")
+        << "Dynamic reference to MultiInterfaceA received the wrong interface "
+           "pointer: WhoA() dispatched through MultiInterfaceB's vtable.";
+
+    framework.Stop();
+    framework.WaitForStop(std::chrono::milliseconds::zero());
+}
+
+// ============================================================
+// Regression test for the same defect on the UNBIND path.
+//
+// ComponentContextImpl::LocateService(refName, ServiceReferenceBase const&) is
+// invoked by SingletonComponentConfigurationImpl::UnbindReference (and the
+// BundleOrPrototype equivalent); the pointer it returns is handed to
+// InvokeUnbindMethod -> the component's Unbind callback. It previously passed an
+// empty interface id to the interface-map lookup, which falls back to
+// begin()->second; it now resolves the reference's declared interface id.
+//
+// The consumer stores the shared_ptr it received at bind time (the correct
+// MultiInterfaceA sub-object) and, on unbind, erases by shared_ptr identity.
+// If unbind were to deliver the begin()->second sub-object (MultiInterfaceB)
+// instead, the pointers would compare unequal, the erase would remove nothing,
+// and BoundCount would stay at 1 after the provider is removed.
+TEST(DynamicReferenceBinding, DynamicRefUnbindsDeclaredInterfaceOfMultiInterfaceService)
+{
+    auto framework = cppmicroservices::FrameworkFactory().NewFramework();
+    framework.Start();
+    auto bc = framework.GetBundleContext();
+
+    test::InstallAndStartDS(bc);
+
+    auto consumerBundle = test::InstallAndStartBundle(bc, "TestBundleDSMIConsumer");
+    ASSERT_TRUE(consumerBundle);
+
+    auto probeRef = bc.GetServiceReference<test::MultiInterfaceProbe>();
+    ASSERT_TRUE(probeRef);
+    auto probe = bc.GetService<test::MultiInterfaceProbe>(probeRef);
+    ASSERT_TRUE(probe);
+
+    auto providerBundle = test::InstallAndStartBundle(bc, "TestBundleDSMIProvider");
+    ASSERT_TRUE(providerBundle);
+    ASSERT_EQ(probe->BoundCount(), 1u) << "Setup failed: provider should be bound once.";
+
+    // Removing the provider deactivates its component, unregisters its service and
+    // drives the consumer's dynamic reference through UnbindReference.
+    providerBundle.Stop();
+
+    EXPECT_EQ(probe->BoundCount(), 0u)
+        << "Unbind delivered a pointer that did not match the bound MultiInterfaceA "
+           "sub-object, so the consumer could not release it.";
+
     framework.Stop();
     framework.WaitForStop(std::chrono::milliseconds::zero());
 }
